@@ -1,6 +1,6 @@
 streamlit
-opencv-python==4.9.0.80
-numpy==1.26.4
+opencv-python==4.8.1.78  # Versão estável anterior, muito robusta em Linux
+numpy                    # Deixe o uv/pip resolver a melhor versão
 matplotlib
 pandas
 av==10.0.0
