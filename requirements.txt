@@ -1,7 +1,9 @@
 streamlit
-streamlit-webrtc
-av
+opencv-python
 numpy
-opencv-python-headless
+matplotlib
+pandas
+av
+streamlit-webrtc
 scipy
 plotly
