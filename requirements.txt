@@ -1,9 +1,9 @@
 streamlit
-opencv-python==4.9.0.80  # Versão estável
+opencv-python==4.9.0.80
 numpy==1.26.4
 matplotlib
 pandas
-av==10.0.0               # Tentando uma versão um pouco mais antiga e amplamente compatível do av
-streamlit-webrtc==0.45.0 # Versão específica
+av==10.0.0
+streamlit-webrtc==0.45.0
 scipy
 plotly
