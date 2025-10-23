@@ -26,6 +26,7 @@ TAM_SUAVIZACAO_BPM = 15
 # FUNÇÕES PRINCIPAIS DO MÉTODO POS
 # ==============================================================
 
+
 def aplicar_pos_e_filtrar(C, fps):
     frame_count = len(C)
     l = int(fps * TAM_JANELA_POS_S)
@@ -35,7 +36,7 @@ def aplicar_pos_e_filtrar(C, fps):
     for n in range(frame_count):
         m = max(0, n - l + 1)
         if n - m + 1 == l:
-            window_C = C[m:n+1, :]
+            window_C = C[m : n + 1, :]
             mu = np.mean(window_C, axis=0)
             Cn = window_C / mu[np.newaxis, :]
             S = pp @ Cn.T
@@ -45,7 +46,7 @@ def aplicar_pos_e_filtrar(C, fps):
             alpha = sigma1 / sigma2 if sigma2 != 0 else 0
             h = S1 + alpha * S2
             h -= np.mean(h)
-            H[m:n+1] += h
+            H[m : n + 1] += h
 
     detrended_signal = detrend(H)
     nyquist_freq = 0.5 * fps
@@ -53,7 +54,11 @@ def aplicar_pos_e_filtrar(C, fps):
     high_cutoff = BPM_RANGE[1] / 60.0 / nyquist_freq
     b, a = butter(4, [low_cutoff, high_cutoff], btype="band")
     filtered_signal = filtfilt(b, a, detrended_signal)
-    normalized_signal = (filtered_signal - np.mean(filtered_signal)) / np.std(filtered_signal) if np.std(filtered_signal) != 0 else filtered_signal
+    normalized_signal = (
+        (filtered_signal - np.mean(filtered_signal)) / np.std(filtered_signal)
+        if np.std(filtered_signal) != 0
+        else filtered_signal
+    )
 
     return normalized_signal, detrended_signal, H
 
@@ -63,8 +68,10 @@ def calcular_fft_bpm_snr(normalized_signal, fps):
     yf = fft(normalized_signal)
     xf = fftfreq(N, 1 / fps)
     freqs = xf[xf > 0]
-    amps = 2.0 / N * np.abs(yf[0:N // 2])[1:N // 2 + 1]
-    valid_indices = np.where((freqs * 60 >= BPM_RANGE[0]) & (freqs * 60 <= BPM_RANGE[1]))
+    amps = 2.0 / N * np.abs(yf[0 : N // 2])[1 : N // 2 + 1]
+    valid_indices = np.where(
+        (freqs * 60 >= BPM_RANGE[0]) & (freqs * 60 <= BPM_RANGE[1])
+    )
     valid_freqs = freqs[valid_indices]
     valid_amps = amps[valid_indices]
 
@@ -83,6 +90,7 @@ def calcular_fft_bpm_snr(normalized_signal, fps):
 # ==============================================================
 # PROCESSAMENTO EM TEMPO REAL (WEBCAM)
 # ==============================================================
+
 
 class VideoProcessor(VideoTransformerBase):
     def __init__(self):
@@ -130,7 +138,9 @@ class VideoProcessor(VideoTransformerBase):
             if dedo_na_camera and self.taxa_fps > 0:
                 C_array = np.array(self.C)
                 normalized_signal, _, _ = aplicar_pos_e_filtrar(C_array, self.taxa_fps)
-                bpm_atual, _, _, _ = calcular_fft_bpm_snr(normalized_signal, self.taxa_fps)
+                bpm_atual, _, _, _ = calcular_fft_bpm_snr(
+                    normalized_signal, self.taxa_fps
+                )
                 if bpm_atual is not None:
                     self.valor_bpm.append(bpm_atual)
                     if len(self.valor_bpm) > TAM_SUAVIZACAO_BPM:
@@ -138,7 +148,9 @@ class VideoProcessor(VideoTransformerBase):
                     self.media_bpm = np.mean(self.valor_bpm)
                     self.info_status = f"BPM estimado: {self.media_bpm:.1f}"
                 else:
-                    self.info_status = "Sinal fraco. Mantenha o dedo imóvel e iluminado."
+                    self.info_status = (
+                        "Sinal fraco. Mantenha o dedo imóvel e iluminado."
+                    )
             else:
                 self.valor_bpm = []
                 self.info_status = "Coloque o dedo na câmera e ligue o flash."
@@ -147,9 +159,15 @@ class VideoProcessor(VideoTransformerBase):
 
         cv2.rectangle(imagem, (x_inicio, y_inicio), (x_fim, y_fim), (0, 255, 0), 2)
         cv2.putText(
-            imagem, self.info_status, (30, 60),
-            cv2.FONT_HERSHEY_SIMPLEX, 1.0,
-            (0, 255, 0) if "BPM" in self.info_status else (0, 0, 255), 2,
+            imagem,
+            self.info_status,
+            (30, 60),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1.0,
+            (0, 255, 0) if "BPM" in self.info_status else (0, 0, 255),
+            2,
         )
         cv2.putText(
-            imagem, f"FPS: {self.taxa_fps:.1f}",
+            imagem,
+            f"FPS: {self.taxa_fps:.1f}",
+        )
