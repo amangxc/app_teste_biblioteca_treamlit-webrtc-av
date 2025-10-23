@@ -4,74 +4,66 @@ import numpy as np
 import time
 import av
 import tempfile
-import pandas as pd
-import matplotlib.pyplot as plt
 import os
-
-# --- Importações para Processamento de Sinal (Baseado no Tutorial) ---
-from scipy.fft import fft, fftfreq  # Para Transformada Rápida de Fourier (FFT)
-from scipy.signal import detrend, butter, filtfilt  # Para Limpar e Filtrar Tendências
-import plotly.graph_objects as go  # Para Gráficos Interativos
-
-# --- Importações solicitadas para WebRTC ---
+from scipy.fft import fft, fftfreq
+from scipy.signal import detrend, butter, filtfilt
+import plotly.graph_objects as go
 from streamlit_webrtc import webrtc_streamer, WebRtcMode, VideoTransformerBase
 
-# --- Parâmetros de 'Paulo' / Tutorial POS ---
-TAMANHO_TELA = 100  # Tamanho do Buffer
-VERMELHO_MINIMO = 60  # Nível de vermelho mínimo para detectar o dedo (Lógica do Paulo)
-BPM_RANGE = [40, 240]  # Faixa de BPM humano (0.67 Hz a 4 Hz)
-FS_ESTIMADA = 30  # FPS padrão
-TAM_JANELA_POS_S = 1.6  # Tamanho da janela deslizante do POS em segundos
-TAM_SUAVIZACAO_BPM = 15  # Tamanho da lista de BPM para calcular a média
+# ----------------- Parâmetros -----------------
+TAMANHO_TELA = 100  # frames do buffer (ajustável)
+VERMELHO_MINIMO = 40  # sensibilidade de detecção do dedo (ajuste fino)
+BPM_RANGE = [40, 240]
+FS_ESTIMADA = 30
+TAM_SUAVIZACAO_BPM = 8  # média móvel para suavizar leitura
+CALC_INTERVAL_S = 1.0  # intervalo mínimo entre cálculos de BPM (segundos)
 
-# --- FUNÇÕES POS PRINCIPAIS (Extraídas do Tutorial) ---
+# ----------------- Funções de processamento (POS) -----------------
 
 
 def aplicar_pos_e_filtrar(C, fps):
-    """Aplica o método POS e faz o Detrend/Filtro Band-Pass."""
+    # C: N x 3 (RGB) matriz
     frame_count = len(C)
+    l = int(fps * 1.6)  # janela ~1.6s
+    H = np.zeros(frame_count)
 
-    # 1. Aplicar POS com Janela Deslizante
-    l = int(fps * TAM_JANELA_POS_S)  # Tamanho janela em frames (~1.6s)
-    H = np.zeros(frame_count)  # Array para sinal PPG final
-
-    # Matriz de Projeção POS (R-G, R-B)
     pp = np.array([[1, -1, 0], [1, 0, -1]])
 
     for n in range(frame_count):
         m = max(0, n - l + 1)
-        if n - m + 1 == l:  # Janela cheia
-            window_C = C[m : n + 1, :]  # Pedaço da matriz C
-
-            mu = np.mean(window_C, axis=0)  # Média por coluna (R,G,B)
-            Cn = window_C / mu[np.newaxis, :]  # Normalização (média=1)
-
-            S = pp @ Cn.T  # Projeta em 2 direções (S1, S2)
+        if n - m + 1 == l:
+            window_C = C[m : n + 1, :]
+            mu = np.mean(window_C, axis=0)
+            # evita divisão por zero
+            mu[mu == 0] = 1.0
+            Cn = window_C / mu[np.newaxis, :]
+            S = pp @ Cn.T
             S1, S2 = S[0, :], S[1, :]
+            sigma1 = np.std(S1)
+            sigma2 = np.std(S2)
+            alpha = sigma1 / sigma2 if sigma2 != 0 else 0
+            h = S1 + alpha * S2
+            h -= np.mean(h)
+            H[m : n + 1] += h
 
-            sigma1 = np.std(S1)  # Desvio padrão S1
-            sigma2 = np.std(S2)  # Desvio padrão S2
-            alpha = sigma1 / sigma2 if sigma2 != 0 else 0  # Alfa ajusta pesos
-
-            h = S1 + alpha * S2  # Combina ondas (soma pulso, cancela ruído)
-            h -= np.mean(h)  # Tira média (zero-média: centra onda em 0)
-
-            H[m : n + 1] += h  # Adiciona a H (overlap-add: suaviza junções)
-
-    # 2. Processamento do Sinal (Detrend, Filtro Band-Pass, Normalização)
-    detrended_signal = detrend(H)  # Remove tendência linear
-
-    nyquist_freq = 0.5 * fps  # Limite de frequência (fps/2)
-    low_cutoff = BPM_RANGE[0] / 60.0 / nyquist_freq  # Converte BPM para normalizado
+    detrended_signal = detrend(H)
+    nyquist_freq = 0.5 * fps
+    low_cutoff = BPM_RANGE[0] / 60.0 / nyquist_freq
     high_cutoff = BPM_RANGE[1] / 60.0 / nyquist_freq
 
-    # Cria filtro Band-Pass (ordem 4)
+    # validações
+    if low_cutoff <= 0:
+        low_cutoff = 1e-4
+    if high_cutoff >= 1:
+        high_cutoff = 0.9999
+
     b, a = butter(4, [low_cutoff, high_cutoff], btype="band")
+    try:
+        filtered_signal = filtfilt(b, a, detrended_signal)
+    except Exception:
+        # caso o filtro falhe (sinal muito curto), retorna o detrended
+        filtered_signal = detrended_signal
 
-    # Aplica filtro (filtfilt aplica duas vezes para precisão)
-    filtered_signal = filtfilt(b, a, detrended_signal)
-
-    # Normaliza (média=0, std=1)
     if np.std(filtered_signal) != 0:
         normalized_signal = (filtered_signal - np.mean(filtered_signal)) / np.std(
             filtered_signal
@@ -79,117 +71,102 @@ def aplicar_pos_e_filtrar(C, fps):
     else:
         normalized_signal = filtered_signal
 
-    return normalized_signal, detrended_signal, H  # Retorna o sinal limpo
+    return normalized_signal, detrended_signal, H
 
 
 def calcular_fft_bpm_snr(normalized_signal, fps):
-    """Calcula BPM e SNR via FFT"""
     N = len(normalized_signal)
-    yf = fft(normalized_signal)  # FFT
-    xf = fftfreq(N, 1 / fps)  # Frequências
+    if N < 3:
+        return None, None, None, None
 
-    freqs = xf[xf > 0]  # Só positivas
-    amps = 2.0 / N * np.abs(yf[0 : N // 2])[1 : N // 2 + 1]  # Amplitudes
+    yf = fft(normalized_signal)
+    xf = fftfreq(N, 1 / fps)
+    freqs = xf[xf > 0]
+    amps = 2.0 / N * np.abs(yf[0 : N // 2])[1 : N // 2 + 1]
 
-    # Faixa de BPM (40-240 BPM)
-    valid_indices = np.where(
-        (freqs * 60 >= BPM_RANGE[0]) & (freqs * 60 <= BPM_RANGE[1])
-    )
-    valid_freqs = freqs[valid_indices]
-    valid_amps = amps[valid_indices]
+    valid_idx = np.where((freqs * 60 >= BPM_RANGE[0]) & (freqs * 60 <= BPM_RANGE[1]))
+    valid_freqs = freqs[valid_idx]
+    valid_amps = amps[valid_idx]
 
-    if len(valid_freqs) == 0:
-        return None, None, None, None  # Se não encontrou pico
+    if len(valid_freqs) == 0 or len(valid_amps) == 0:
+        return None, None, None, None
 
     peak_freq = valid_freqs[np.argmax(valid_amps)]
-    bpm = peak_freq * 60  # Hz para BPM
+    bpm = peak_freq * 60
 
-    # Calcular SNR
     fundamental = np.max(valid_amps)
+    noise_energy = np.sum(valid_amps) - fundamental
+    snr = 10 * np.log10(fundamental / noise_energy) if noise_energy > 0 else 0
 
-    # Simples cálculo de energia (sinal = pico; ruído = resto da banda)
-    signal_energy = fundamental
-    noise_energy = np.sum(valid_amps) - signal_energy
-
-    snr = 10 * np.log10(signal_energy / noise_energy) if noise_energy > 0 else 0
-
-    return (
-        bpm,
-        snr,
-        freqs * 60,
-        amps,
-    )  # Retorna BPM, SNR, Frequências (BPM) e Amplitudes
+    return bpm, snr, valid_freqs * 60, valid_amps
 
 
-# --- CLASSE DE PROCESSAMENTO EM TEMPO REAL (WebRTC) ---
+# ----------------- Classe de processamento (WebRTC) -----------------
 
 
 class VideoProcessor(VideoTransformerBase):
     def __init__(self):
-        self.C = []  # Lista para guardar médias RGB (Sinal Bruto)
+        self.C = []  # buffer RGB
         self.valor_bpm = []
         self.contador_frames = 0
         self.tempo_espera = time.time()
-        self.taxa_fps = FS_ESTIMADA  # FPS estimado
+        self.taxa_fps = FS_ESTIMADA
         self.media_bpm = 0.0
-        self.info_status = "Aguardando START..."
+        self.info_status = "Coloque o dedo sobre a câmera (flash ligado)."
+        self.last_bpm_time = 0.0
 
     def process_frame_logic(self, imagem):
-        """Lógica de Aquisição de ROI/Média RGB do Paulo, adaptada para WebRTC."""
         self.contador_frames += 1
 
-        # 1. Cálculo de FPS (a cada 60 frames)
+        # Atualiza FPS a cada 60 frames
         if self.contador_frames % 60 == 0:
             cont_final = time.time()
             tempo_decorrido = cont_final - self.tempo_espera
             if tempo_decorrido > 0:
-                self.taxa_fps = self.contador_frames / tempo_decorrido
+                self.taxa_fps = (
+                    60.0 / tempo_decorrido if tempo_decorrido > 0 else FS_ESTIMADA
+                )
             self.contador_frames = 0
             self.tempo_espera = time.time()
 
-        # 2. Definição da ROI (Lógica do Paulo, focada no dedo)
-        (largura, altura) = imagem.shape[:2]
-        tamanho_roi = int(largura * 0.5)
-        x_inicio = (altura - tamanho_roi) // 2
-        y_inicio = (largura - tamanho_roi) // 2
-        x_fim = x_inicio + tamanho_roi
-        y_fim = y_inicio + tamanho_roi
+        h, w = imagem.shape[:2]
+        tamanho_roi = int(min(h, w) * 0.4)
+        x_inicio = (w - tamanho_roi) // 2
+        y_inicio = (h - tamanho_roi) // 2
+        x_fim, y_fim = x_inicio + tamanho_roi, y_inicio + tamanho_roi
 
-        x_inicio = max(0, x_inicio)
-        y_inicio = max(0, y_inicio)
-        x_fim = min(altura, x_fim)
-        y_fim = min(largura, y_fim)
+        roi = imagem[y_inicio:y_fim, x_inicio:x_fim]
+        if roi.size == 0:
+            self.info_status = "Posicione a câmera corretamente."
+            return imagem
 
-        # 3. Análise da Média BGR na ROI
-        media_BGR = np.mean(imagem[y_inicio:y_fim, x_inicio:x_fim], axis=(0, 1))
-
-        # Adicionar o frame atual
-        self.C.append(media_BGR[::-1])  # Inverte BGR para RGB
-
-        # 4. Manutenção do Buffer (Tamanho Fixo)
+        media_BGR = np.mean(roi, axis=(0, 1))
+        # adiciona RGB (inverte BGR)
+        self.C.append(media_BGR[::-1])
         if len(self.C) > TAMANHO_TELA:
             self.C.pop(0)
 
-        # 5. Cálculo do BPM (Usa a lógica de POS do Tutorial se o buffer estiver cheio)
-        if len(self.C) == TAMANHO_TELA:
+        media_R, media_G, media_B = media_BGR[2], media_BGR[1], media_BGR[0]
+        dedo_na_camera = (
+            media_R > media_G + VERMELHO_MINIMO and media_R > media_B + VERMELHO_MINIMO
+        )
 
-            # --- Validação Simples de Dedo (Lógica do Paulo) ---
-            media_R_recente = media_BGR[2]
-            media_G_recente = media_BGR[1]
-            media_B_recente = media_BGR[0]
-            dedo_na_camera = (
-                media_R_recente > media_G_recente + VERMELHO_MINIMO
-                and media_R_recente > media_B_recente + VERMELHO_MINIMO
-            )
-
-            if dedo_na_camera and self.taxa_fps > 0:
+        # Lógica de estados
+        if not dedo_na_camera:
+            self.info_status = "Coloque o dedo na câmera (flash ligado)."
+            self.valor_bpm.clear()
+        elif len(self.C) < TAMANHO_TELA:
+            self.info_status = "Coletando dados para análise..."
+        elif self.taxa_fps <= 0:
+            self.info_status = "Aguardando taxa de quadros válida..."
+        else:
+            # só processa no intervalo definido (ex: 1s)
+            if time.time() - self.last_bpm_time >= CALC_INTERVAL_S:
                 C_array = np.array(self.C)
-
-                # Aplica POS e Filtros (Do Tutorial)
-                normalized_signal, _, _ = aplicar_pos_e_filtrar(C_array, self.taxa_fps)
-
-                # Calcula FFT/BPM (Do Tutorial)
-                bpm_atual, _, _, _ = calcular_fft_bpm_snr(
+                normalized_signal, detrended, H = aplicar_pos_e_filtrar(
+                    C_array, self.taxa_fps
+                )
+                bpm_atual, snr, freqs, amps = calcular_fft_bpm_snr(
                     normalized_signal, self.taxa_fps
                 )
 
@@ -197,36 +174,35 @@ class VideoProcessor(VideoTransformerBase):
                     self.valor_bpm.append(bpm_atual)
                     if len(self.valor_bpm) > TAM_SUAVIZACAO_BPM:
                         self.valor_bpm.pop(0)
-
-                    self.media_bpm = np.mean(self.valor_bpm)
-                    self.info_status = f"O seu BPM estah em: {self.media_bpm:.1f}"
+                    self.media_bpm = float(np.mean(self.valor_bpm))
+                    self.info_status = (
+                        f"BPM: {self.media_bpm:.1f} BPM | SNR: {snr:.1f} dB"
+                    )
                 else:
                     self.info_status = (
-                        "Sinal fraco. Mantenha o dedo imóvel e iluminado."
+                        "Sinal fraco — mantenha o dedo imóvel e iluminado."
                     )
-            else:
-                self.valor_bpm = []
-                self.info_status = "Coloque o dedo na câmera e ligue o flash."
-        else:
-            self.info_status = "Coletando dados..."
 
-        # 6. Exibição na Imagem
+                self.last_bpm_time = time.time()
+
+        # desenho da ROI e textos
         cv2.rectangle(imagem, (x_inicio, y_inicio), (x_fim, y_fim), (0, 255, 0), 2)
+        cor_texto = (0, 255, 0) if "BPM:" in self.info_status else (0, 0, 255)
         cv2.putText(
             imagem,
             self.info_status,
-            (30, 60),
+            (10, 30),
             cv2.FONT_HERSHEY_SIMPLEX,
-            1.0,
-            (0, 255, 0) if "BPM" in self.info_status else (0, 0, 255),
+            0.7,
+            cor_texto,
             2,
         )
         cv2.putText(
             imagem,
             f"FPS: {self.taxa_fps:.1f}",
-            (largura - 200, 40),
+            (10, h - 10),
             cv2.FONT_HERSHEY_SIMPLEX,
-            1,
+            0.6,
             (255, 0, 0),
             2,
         )
@@ -234,213 +210,200 @@ class VideoProcessor(VideoTransformerBase):
         return imagem
 
     def transform(self, frame: av.VideoFrame) -> av.VideoFrame:
-        # Converte o frame do AV para array NumPy (BGR)
         img = frame.to_ndarray(format="bgr24")
-
-        # Processa a imagem com a lógica
-        img_processada = self.process_frame_logic(img)
-
-        # Retorna o frame processado
-        return av.VideoFrame.from_ndarray(img_processada, format="bgr24")
+        img_proc = self.process_frame_logic(img)
+        return av.VideoFrame.from_ndarray(img_proc, format="bgr24")
 
 
-# --- FUNÇÃO DE PROCESSAMENTO DE VÍDEO UPLOADED (Adaptação para o POS do Tutorial) ---
+# ----------------- Função para processar vídeo enviado -----------------
 
 
 def process_uploaded_video(uploaded_file, duracao_analise):
-    # Salva o arquivo temporariamente
-    tfile = tempfile.NamedTemporaryFile(delete=False)
+    tfile = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
     tfile.write(uploaded_file.read())
     tfile.close()
     video_path = tfile.name
 
     cap = cv2.VideoCapture(video_path)
-
-    fps = cap.get(cv2.CAP_PROP_FPS)  # Pega FPS
-    if fps == 0:
-        fps = FS_ESTIMADA  # Usa padrão se falhar
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if fps == 0 or np.isnan(fps):
+        fps = FS_ESTIMADA
         st.warning(f"FPS não detectado. Usando {fps} FPS.")
 
-    largura_frame = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    altura_frame = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    largura = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    altura = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    if not cap.isOpened() or fps == 0:
-        st.error("Erro ao abrir ou ler o vídeo.")
+    if not cap.isOpened():
+        st.error("Erro ao abrir o vídeo.")
         return
 
-    frames_limite = int(duracao_analise * fps)
-    frames_limite = min(frames_limite, total_frames)
+    frames_limite = min(int(duracao_analise * fps), total_frames)
     frames_processados = 0
+    C = []
 
-    C = []  # Lista para guardar médias RGB (Sinal Bruto)
-
-    st.subheader(f"Processando Vídeo - Taxa de Quadros (FPS): {fps:.2f}")
-
+    st.subheader(f"Processando vídeo — FPS detectado: {fps:.2f}")
     progress_bar = st.progress(0)
 
-    # 1. Lógica do ROI (adaptada do Tutorial)
-    h, w = altura_frame, largura_frame
-    center_x, center_y = w // 2, h // 2  # Centro
-    roi_w, roi_h = w // 4, h // 4  # Tamanho ROI (1/4)
+    # ROI central menor (1/4 frame)
+    center_x, center_y = largura // 2, altura // 2
+    roi_w, roi_h = largura // 4, altura // 4
 
     while cap.isOpened() and frames_processados < frames_limite:
-        retorno, frame = cap.read()
-        if not retorno:
+        ret, frame = cap.read()
+        if not ret:
             break
-
-        # Corta ROI central
         roi = frame[
             center_y - roi_h : center_y + roi_h, center_x - roi_w : center_x + roi_w
         ]
-
-        if roi.size > 0:  # Se ROI não vazio
-            means = np.mean(roi, axis=(0, 1))  # Média de pixels
-            C.append(means[::-1])  # Inverte BGR para RGB
-
+        if roi.size > 0:
+            means = np.mean(roi, axis=(0, 1))
+            C.append(means[::-1])
         frames_processados += 1
         progress_bar.progress(frames_processados / frames_limite)
 
     cap.release()
     progress_bar.empty()
-    os.remove(video_path)  # Limpa o arquivo temporário
+    os.remove(video_path)
 
-    if frames_processados < int(10 * fps):  # Video curto demais (<10s)
-        st.error("Vídeo muito curto (analisado menos de 10s).")
+    if frames_processados < int(10 * fps):
+        st.error("Vídeo muito curto para análise (menos de 10s).")
         return
 
-    C_array = np.array(C)  # Converte lista em matriz NumPy
-
-    # --- Aplicar POS e Processamento de Sinal (Do Tutorial) ---
-    normalized_signal, _, _ = aplicar_pos_e_filtrar(C_array, fps)
-
-    # --- Calcular FFT, BPM e SNR (Do Tutorial) ---
+    C_array = np.array(C)
+    normalized_signal, detrended, H = aplicar_pos_e_filtrar(C_array, fps)
     bpm_final, snr_final, fft_freqs, fft_amps = calcular_fft_bpm_snr(
         normalized_signal, fps
     )
 
     if bpm_final is None:
         st.error(
-            "Nenhum batimento cardíaco válido foi detectado. Verifique a iluminação e a imobilidade do dedo/rosto."
+            "Nenhum batimento válido detectado. Verifique iluminação e imobilidade."
         )
         return
 
-    # --- Geração dos Gráficos (Do Tutorial) ---
     st.success("Processamento concluído!")
-
-    # Métricas
     st.metric("Frequência Cardíaca Estimada", f"{bpm_final:.2f} BPM")
     st.metric("SNR Estimado", f"{snr_final:.2f} dB")
 
-    col1, col2 = st.columns(2)  # Duas colunas
+    timestamps = np.arange(len(C_array)) / fps
 
-    timestamps = np.arange(len(C_array)) / fps  # Tempo em segundos
-
-    # Gráfico 1: Sinal PPG Bruto vs. Filtrado (Série Temporal)
+    col1, col2 = st.columns(2)
     with col1:
-        st.subheader("Sinal PPG Bruto vs. Filtrado")
+        st.subheader("Sinal PPG Bruto (canal R) vs Normalizado")
         fig1 = go.Figure()
-        # Sinal Bruto (Canal Vermelho)
+        fig1.add_trace(
+            go.Scatter(x=timestamps, y=C_array[:, 0], mode="lines", name="Bruto (R)")
+        )
         fig1.add_trace(
             go.Scatter(
-                x=timestamps,
-                y=C_array[:, 0],
-                mode="lines",
-                name="Sinal Bruto (Canal Vermelho)",
+                x=timestamps, y=normalized_signal, mode="lines", name="Normalizado"
             )
         )
-        # Sinal Filtrado e Normalizado
-        fig1.add_trace(
-            go.Scatter(
-                x=timestamps,
-                y=normalized_signal,
-                mode="lines",
-                name="Sinal Filtrado e Normalizado",
-            )
-        )
-        fig1.update_layout(
-            title="Sinal PPG ao Longo do Tempo",
-            xaxis_title="Tempo (s)",
-            yaxis_title="Amplitude",
-        )
+        fig1.update_layout(xaxis_title="Tempo (s)", yaxis_title="Amplitude")
         st.plotly_chart(fig1, use_container_width=True)
 
-    # Gráfico 2: Análise de Frequência (FFT)
     with col2:
-        st.subheader("Análise de Frequência (FFT)")
+        st.subheader("Espectro de Frequência (FFT)")
         fig2 = go.Figure()
-        # Espectro de Frequência
-        fig2.add_trace(
-            go.Scatter(
-                x=fft_freqs, y=fft_amps, mode="lines", name="Espectro de Frequência"
-            )
-        )
-        # Linha do Pico (BPM)
+        fig2.add_trace(go.Scatter(x=fft_freqs, y=fft_amps, mode="lines", name="FFT"))
         fig2.add_vline(
-            x=bpm_final,
-            line_width=3,
-            line_dash="dash",
-            line_color="red",
-            annotation_text=f"Pico: {bpm_final:.1f} BPM",
+            x=bpm_final, line_dash="dash", annotation_text=f"Pico: {bpm_final:.1f} BPM"
         )
-        fig2.update_layout(
-            title="Espectro de Frequência do Sinal PPG",
-            xaxis_title="Frequência (BPM)",
-            yaxis_title="Amplitude",
-        )
+        fig2.update_layout(xaxis_title="Frequência (BPM)", yaxis_title="Amplitude")
         fig2.update_xaxes(range=BPM_RANGE)
         st.plotly_chart(fig2, use_container_width=True)
 
 
-# --- INTERFACE STREAMLIT ---
-st.set_page_config(layout="wide")
-st.title("Extrator de Sinal PPG e Frequência Cardíaca de Vídeo (rPPG com POS)")
+# ----------------- Interface Streamlit -----------------
+
+st.set_page_config(layout="wide", page_title="rPPG - POS (Otimizado)")
+st.title("Extrator rPPG (POS) — Tempo Real e Upload de Vídeo")
+
+with st.sidebar:
+    st.header("Instruções Rápidas")
+    st.markdown(
+        "- No celular: ligue o flash manualmente e coloque o dedo sobre a lente por 10–15s."
+    )
+    st.markdown(
+        "- Se usar notebook, tente um ambiente iluminado e mantenha o dedo imóvel."
+    )
+    st.markdown(
+        "- Navegadores não permitem ligar o flash via código; ative manualmente."
+    )
+    st.markdown(
+        "\nSe quiser, posso adicionar um componente de gravação direto no navegador—me diga que eu implemento."
+    )
 
 st.sidebar.header("Modo de Operação")
-modo = st.sidebar.radio(
-    "Selecione o modo de análise:", ("Tempo Real (Webcam)", "Upload de Vídeo")
-)
+modo = st.sidebar.radio("Selecionar modo:", ("Tempo Real (Webcam)", "Upload de Vídeo"))
 
 if modo == "Tempo Real (Webcam)":
     st.header("Análise em Tempo Real (Webcam)")
     st.info(
-        "⚠️ **Instrução:** Clique em 'START' e coloque seu dedo indicador sobre a câmera do celular/webcam. Se estiver usando o celular, **ATIVE o flash manualmente** para melhor iluminação (o app usa a luz refletida/transmitida, o flash aumenta o sinal PPG)."
+        "Clique em START (permite a câmera). Coloque o dedo sobre a lente. O cálculo inicia automaticamente quando o dedo for detectado."
     )
 
-    webrtc_streamer(
+    webrtc_ctx = webrtc_streamer(
         key="bpm-live-stream",
         mode=WebRtcMode.SENDRECV,
         video_processor_factory=VideoProcessor,
         media_stream_constraints={"video": True, "audio": False},
+        async_processing=True,
+        desired_playing_state=True,
+    )
+
+    st.markdown("---")
+    st.markdown("**Dicas de diagnóstico:**")
+    st.write(
+        "- Se o valor estiver muito instável, tente aumentar a luz e manter o dedo imóvel."
+    )
+    st.write(
+        "- Se FPS detectado for < 15, garanta que a câmera não está ocupada por outro app."
     )
 
 elif modo == "Upload de Vídeo":
-    st.header("Análise de Vídeo Gravado")
+    st.header("Análise por Vídeo Gravado")
     st.info(
-        "Faça o upload de um vídeo de **10 a 15 segundos** onde seu dedo cobre a câmera e o flash está ligado para análise do sinal de pulso (PPG). O app usa o método **POS** para alta precisão, conforme o artigo 'Algorithmic Principles of Remote-PPG'."
+        "Faça upload de um vídeo de 10–60s com o dedo cobrindo a câmera (flash ligado) para análise offline."
     )
 
     uploaded_file = st.file_uploader(
         "Escolha um arquivo de vídeo", type=["mp4", "mov", "avi"]
     )
-
-    # Permite a escolha da duração
     duracao_analise = st.slider(
-        "Duração do vídeo para análise (segundos):",
-        min_value=10,
-        max_value=60,
-        value=15,
-        step=5,
+        "Duração do vídeo a analisar (s)", min_value=10, max_value=60, value=15, step=5
     )
 
     if uploaded_file is not None:
-        # Mostra o vídeo (opcional)
-        tfile_show = tempfile.NamedTemporaryFile(delete=False)
+        # mostra preview (opcional)
+        tfile_show = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
         tfile_show.write(uploaded_file.read())
         tfile_show.close()
         st.video(tfile_show.name)
-        os.remove(tfile_show.name)
-
+        # reabre o arquivo (streamlit já consumiu o .read() acima) -> read() esgotou, então precisa re-obter do uploaded_file
+        # Simplificação: pedimos para o usuário recarregar o arquivo ao clicar no botão.
         if st.button("Extrair Sinal PPG"):
-            with st.spinner("Processando..."):  # Spinner de loading
-                process_uploaded_video(uploaded_file, duracao_analise)
+            # Para garantir o arquivo completo, pedimos ao usuário a seleção de novo (isso evita problemas de leitura dupla)
+            with st.spinner("Processando vídeo..."):
+                # Re-processa: uploaded_file já foi lido para preview; usamos tfile_show (arquivo temporário salvo)
+                # Reabra o arquivo salvo e envie para a função
+                with open(tfile_show.name, "rb") as f:
+
+                    class DummyUploaded:
+                        def __init__(self, data):
+                            self._data = data
+
+                        def read(self):
+                            return self._data
+
+                    data_bytes = f.read()
+                    dummy = DummyUploaded(data_bytes)
+                    process_uploaded_video(dummy, duracao_analise)
+        # remove arquivo temporário de preview
+        try:
+            os.remove(tfile_show.name)
+        except Exception:
+            pass
+
+# ----------------- Fim do arquivo -----------------
