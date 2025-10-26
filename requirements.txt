@@ -1,9 +1,6 @@
 streamlit
-opencv-python
-numpy
-matplotlib
-pandas
-av
 streamlit-webrtc
+opencv-python-headless
+numpy
 scipy
-plotly
+av
