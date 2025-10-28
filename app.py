@@ -1,253 +1,218 @@
 import streamlit as st
 import cv2
 import numpy as np
+import threading
 import time
-
-# from scipy.signal import butter, filtfilt, find_peaks  <<<<< REMOVIDO
 from streamlit_webrtc import webrtc_streamer, VideoProcessorBase
 import av
-
-# --- 1. CONFIGURAÇÃO DA PÁGINA E CONSTANTES ---
-st.set_page_config(page_title="Monitor BPM", layout="centered")
-TAMANHO_TELA = 50  # Buffer de 50 frames
-CALCULAR_A_CADA_N_FRAMES = 30  # Só calcula o BPM a cada 30 frames
-
-# --- 2. CSS PARA ESCONDER "RUNNING" E "STOP" ---
-css_limpeza_total = """
-<style>
-    div[data-testid="stWebRTCStatus"] { display: none; }
-    div[key="camera_flash"] button[title="Stop"] { display: none; }
-</style>
-"""
-st.markdown(css_limpeza_total, unsafe_allow_html=True)
-
-# --- 3. FUNÇÃO DE FILTRO (REMOVIDA) ---
-# A função bandpass_filter(scipy) foi removida por ser muito pesada.
+from scipy.signal import detrend, butter, filtfilt
+from scipy.fft import fft, fftfreq
 
 
-# --- NOVA FUNÇÃO "LEVE" PARA ACHAR PICOS ---
-def find_peaks_light(signal, distance, prominence_factor=0.5):
+# Configuração Streamlit
+st.set_page_config(page_title="PPG Real-Time + Flash", layout="centered")
+st.title("💡 Monitor Cardíaco em Tempo Real")
+
+
+# CSS (coloquei para tentar tirar os botões, mas falhei miseravelmente)
+st.markdown(
     """
-    Uma versão muito mais leve do scipy.find_peaks.
-    Acha picos que são maiores que seus vizinhos e que passam de um
-    limite (threshold) dinâmico.
-    """
-    if len(signal) == 0:
-        return []
+    <style>
+    /* Esconde a linha "Running" / "Stopped" */
+    div[data-testid="stWebRTCStatus"] { 
+        display: none !important; 
+    }
 
-    # Limite (threshold) dinâmico: Média + (fator * desvio_padrão)
-    # Isso ajuda a ignorar picos pequenos que são só ruído
-    signal_mean = np.mean(signal)
-    signal_std = np.std(signal)
-    threshold = signal_mean + prominence_factor * signal_std
+    /* Nova regra para esconder botões e seletor */
+    div[data-key="camera_flash"] {
+        .toolbar { display: none !important; }
+        button[title="Start"], button[title="Stop"] { display: none !important; }
+        select[title="Select device"] { display: none !important; }
+        label { display: none !important; }
+    }
 
-    candidate_peaks = []
-    # Acha picos que são maiores que os vizinhos e maiores que o threshold
-    for i in range(1, len(signal) - 1):
-        if (
-            signal[i] > signal[i - 1]
-            and signal[i] > signal[i + 1]
-            and signal[i] > threshold
-        ):
-            candidate_peaks.append(i)
+    /* Rotação do vídeo */
+    video {
+        transform: rotate(90deg);
+        object-fit: cover;
+        width: 100%;
+        height: 80vh;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
-    if not candidate_peaks:
-        return []
+# Botão Ligar/Desligar Câmera
+if "camera_on" not in st.session_state:
+    st.session_state.camera_on = False
 
-    # Filtra os picos para garantir a "distância" mínima entre eles
-    final_peaks = [candidate_peaks[0]]  # Adiciona o primeiro pico candidato
-    for i in range(1, len(candidate_peaks)):
-        # Se o pico atual está longe o suficiente do último pico adicionado...
-        if candidate_peaks[i] - final_peaks[-1] >= distance:
-            final_peaks.append(candidate_peaks[i])  # ...adiciona ele
-
-    return np.array(final_peaks)
+st.toggle("Ligar/Desligar Câmera", key="camera_on")
 
 
-# --- 4. INICIALIZAÇÃO DO ESTADO GLOBAL (st.session_state) ---
-if "buffer_G" not in st.session_state:
-    st.session_state.buffer_G = []  # Só precisamos do buffer Green agora
-if "bpm_fixado" not in st.session_state:
-    st.session_state.bpm_fixado = None
-if "bpm_primeiros" not in st.session_state:
-    st.session_state.bpm_primeiros = []
-if "medir_novamente" not in st.session_state:
-    st.session_state.medir_novamente = True
-if "camera_ligada" not in st.session_state:
-    st.session_state.camera_ligada = False
-if "info_bpm" not in st.session_state:
-    st.session_state.info_bpm = "Aguarde..."
-
-
-# --- 5. A CLASSE "PROCESSADORA" (VERSÃO LEVE) ---
+# Processador de vídeo
 class MeuProcessadorDeVideo(VideoProcessorBase):
-
     def __init__(self):
+        self.buffer_R = []
+        self.buffer_G = []
+        self.buffer_B = []
+        self.buffer_size = 150
+        self.lock = threading.Lock()
+        self.bpm = 0.0
+        self.fps = 0.0
         self.contador_frames = 0
         self.tempo_espera = time.time()
-        self.taxa_fps = 15.0
+        self.alpha_suavizacao = 0.1
 
     def recv(self, frame):
-        img = frame.to_ndarray(format="bgr24")
-        self.contador_frames += 1
+        with self.lock:
+            img = frame.to_ndarray(format="bgr24")
+            h, w = img.shape[:2]
 
-        # --- Lógica de FPS (LEVE) ---
-        if self.contador_frames % CALCULAR_A_CADA_N_FRAMES == 0:
-            cont_final = time.time()
-            tempo_decorrido = cont_final - self.tempo_espera
-            if tempo_decorrido > 0:
-                self.taxa_fps = CALCULAR_A_CADA_N_FRAMES / tempo_decorrido
-            self.tempo_espera = time.time()
+            # ROI (Região de Interesse)
+            roi_size = min(h, w) // 3
+            x_i = (w - roi_size) // 2
+            y_i = (h - roi_size) // 2
+            roi = img[y_i : y_i + roi_size, x_i : x_i + roi_size]
 
-        # --- Lógica do ROI (LEVE) ---
-        (largura, altura) = img.shape[:2]
-        tamanho_roi = int(largura * 0.5)
-        x_inicio = (altura - tamanho_roi) // 2
-        y_inicio = (largura - tamanho_roi) // 2
-        x_fim = x_inicio + tamanho_roi
-        y_fim = y_inicio + tamanho_roi
-        x_inicio, y_inicio = max(0, x_inicio), max(0, y_inicio)
-        x_fim, y_fim = min(altura, x_fim), min(largura, y_fim)
-
-        media_G = 0.0
-        if x_fim > x_inicio and y_fim > y_inicio:
-            roi_central = img[y_inicio:y_fim, x_inicio:x_fim]
-            cv2.rectangle(img, (x_inicio, y_inicio), (x_fim, y_fim), (0, 255, 0), 2)
-            # Otimização: Só calcula a média do Verde (G), que é o que usamos
-            media_G = np.mean(roi_central[:, :, 1])  # 1 = Canal Verde
-        else:
-            media_G = np.mean(img[:, :, 1])
-
-        # --- Lógica de Buffer (LEVE) ---
-        st.session_state.buffer_G.append(media_G)
-
-        if len(st.session_state.buffer_G) > TAMANHO_TELA:
-            st.session_state.buffer_G.pop(0)
-
-        # --- LÓGICA DE CÁLCULO DE BPM (LEVE) ---
-        if (
-            self.contador_frames % CALCULAR_A_CADA_N_FRAMES == 0
-            and len(st.session_state.buffer_G) == TAMANHO_TELA
-        ):
-
-            # Checagem do dedo na câmera (simplificada, só pelo Verde)
-            media_G_recente = media_G
-            # Se a média de verde for muito baixa, o dedo não está lá.
-            dedo_na_camera = media_G_recente > 50
-
-            if dedo_na_camera and st.session_state.medir_novamente:
-                # Normalização (leve)
-                G_array = np.array(st.session_state.buffer_G)
-                Gnorm = G_array / (np.mean(G_array) + 1e-9)
-                sinal_ac = Gnorm - np.mean(Gnorm)  # Sinal "detrended"
-
-                # --- MUDANÇA PRINCIPAL ---
-                # REMOVIDO: sinal_filtrado = bandpass_filter(...)
-                # Vamos usar o sinal_ac "ruidoso" mesmo
-
-                # REMOVIDO: peaks, _ = find_peaks(...)
-                # USANDO: Nossa função leve
-                peaks = find_peaks_light(
-                    sinal_ac, distance=self.taxa_fps * 0.4, prominence_factor=0.5
-                )
-                # --- FIM DA MUDANÇA ---
-
-                if len(peaks) > 1:
-                    intervalos = np.diff(peaks) / self.taxa_fps
-                    bpm_atual = 60 / np.mean(intervalos)
-
-                    if st.session_state.bpm_fixado is None:
-                        st.session_state.bpm_primeiros.append(bpm_atual)
-                        if len(st.session_state.bpm_primeiros) >= 3:
-                            st.session_state.bpm_fixado = np.mean(
-                                st.session_state.bpm_primeiros
-                            )
-
-                    valor_a_mostrar = (
-                        st.session_state.bpm_fixado
-                        if st.session_state.bpm_fixado is not None
-                        else bpm_atual
-                    )
-                    st.session_state.info_bpm = f"Seu BPM: {valor_a_mostrar:.1f}"
-                else:
-                    st.session_state.info_bpm = (
-                        f"BPM: {st.session_state.bpm_fixado:.1f}"
-                        if st.session_state.bpm_fixado is not None
-                        else "Aguarde..."
-                    )
+            # Lógica de detecção de dedo
+            if roi.size > 0:
+                mean_bgr = np.mean(roi, axis=(0, 1))
+                mean_red_value = mean_bgr[2]  # Canal Vermelho
             else:
-                st.session_state.info_bpm = "Coloque o dedo e pressione 'Medir'"
+                mean_red_value = 0
 
-        # --- Lógica de Desenho (LEVE) ---
-        cor_texto = (0, 255, 0)
-        if (
-            "Aguarde" in st.session_state.info_bpm
-            or "Coloque o dedo" in st.session_state.info_bpm
-        ):
-            cor_texto = (0, 0, 255)
+            RED_THRESHOLD = 220
+            if mean_red_value > RED_THRESHOLD:
+                # Dedo detectado
+                self.buffer_B.append(mean_bgr[0])
+                self.buffer_G.append(mean_bgr[1])
+                self.buffer_R.append(mean_bgr[2])
 
-        cv2.putText(
-            img,
-            st.session_state.info_bpm,
-            (30, 60),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1.0,
-            cor_texto,
-            2,
-        )
+                # Limita o tamanho do buffer
+                if len(self.buffer_R) > self.buffer_size:
+                    self.buffer_R.pop(0)
+                    self.buffer_G.pop(0)
+                    self.buffer_B.pop(0)
 
-        cv2.putText(
-            img,
-            f"FPS: {self.taxa_fps:.1f}",
-            (img.shape[1] - 180, 40),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1,
-            (255, 0, 0),
-            2,
-        )
+                self.contador_frames += 1
+                if self.contador_frames % 10 == 0:
+                    bpm_bruto = self.calcula_bpm()
+                    if bpm_bruto > 40:
+                        self.bpm = (
+                            bpm_bruto
+                            if self.bpm == 0
+                            else (
+                                bpm_bruto * self.alpha_suavizacao
+                                + self.bpm * (1.0 - self.alpha_suavizacao)
+                            )
+                        )
 
-        return av.VideoFrame.from_ndarray(img, format="bgr24")
+                # Calcula FPS
+                agora = time.time()
+                delta_t = agora - self.tempo_espera
+                if delta_t > 0:
+                    self.fps = 10 / delta_t
+                self.tempo_espera = agora
+
+                # Mostra BPM
+                cv2.putText(
+                    img,
+                    f"BPM: {self.bpm:.1f}",
+                    (30, 80),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1,
+                    (255, 255, 255),
+                    2,
+                )
+            else:
+
+                # Dedo não detectado
+                if len(self.buffer_R) > 0:
+                    self.buffer_R.clear()
+                    self.buffer_G.clear()
+                    self.buffer_B.clear()
+                    self.bpm = 0.0
+                    self.contador_frames = 0
+                    self.tempo_espera = time.time()
+
+                # Mostra instrução
+                cv2.putText(
+                    img,
+                    "Posicione o dedo",
+                    (30, 80),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8,
+                    (0, 255, 255),
+                    2,
+                )
+
+            # Desenha ROI + FPS
+            cv2.rectangle(
+                img, (x_i, y_i), (x_i + roi_size, y_i + roi_size), (0, 255, 0), 2
+            )
+            cv2.putText(
+                img,
+                f"FPS: {self.fps:.1f}",
+                (30, 40),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1,
+                (255, 0, 0),
+                2,
+            )
+
+            return av.VideoFrame.from_ndarray(img, format="bgr24")
+
+    # Função de cálculo de BPM (Filtros e FFT)
+    def calcula_bpm(self):
+        if len(self.buffer_R) < 30:
+            return 0
+
+        Gnorm = np.array(self.buffer_G) / (np.mean(self.buffer_G) + 1e-9)
+        sinal_ac = -(Gnorm - np.mean(Gnorm))
+
+        try:
+            fs = self.fps
+            if fs < 1.0:
+                return 0
+
+            nyq = 0.5 * fs
+            b, a = butter(2, [0.7 / nyq, 3.5 / nyq], btype="band")
+            filtered = filtfilt(b, a, sinal_ac)
+
+            N = len(filtered)
+            yf = np.abs(fft(filtered))
+            xf = fftfreq(N, d=1 / fs)
+            bpm_vals = xf * 60
+            idx = (bpm_vals > 40) & (bpm_vals < 200)
+
+            if np.sum(idx) == 0:
+                return 0
+
+            peak_idx = np.argmax(yf[idx])
+            return bpm_vals[idx][peak_idx]
+
+        except:
+            return 0
 
 
-# --- 6. AS "CONSTRAINTS" (OTIMIZADAS) ---
+# Configuração WebRTC (Flash ligado)
 video_constraints = {
     "video": {
-        "facingMode": "environment",
-        "width": {"ideal": 640},
-        "height": {"ideal": 480},
-        "frameRate": {"ideal": 15},
-        "advanced": [{"torch": True}, {"focusMode": "continuous"}],
+        "facingMode": {"ideal": "environment"},
+        "width": {"ideal": 1920},
+        "height": {"ideal": 1080},
+        "frameRate": {"ideal": 30},
+        "torch": True,
     }
 }
 
-# --- 7. A Interface do App ---
-st.title("Monitor de Batimentos")
 
-button_text = "Fechar Câmera" if st.session_state.camera_ligada else "Abrir Câmera"
-if st.button(button_text):
-    st.session_state.camera_ligada = not st.session_state.camera_ligada
-    if st.session_state.camera_ligada:
-        st.session_state.bpm_fixado = None
-        st.session_state.bpm_primeiros = []
-        st.session_state.medir_novamente = True
-        st.session_state.info_bpm = "Aguarde..."
-    st.rerun()
-
-if st.button("Medir Novamente"):
-    st.session_state.bpm_fixado = None
-    st.session_state.bpm_primeiros = []
-    st.session_state.medir_novamente = True
-    st.session_state.info_bpm = "Aguarde..."
-    st.rerun()
-
-# --- 8. RENDERIZAÇÃO CONDICIONAL ---
-if st.session_state.camera_ligada:
-    webrtc_streamer(
-        key="camera_flash",
-        video_processor_factory=MeuProcessadorDeVideo,
-        media_stream_constraints=video_constraints,
-        async_processing=True,
-        desired_playing_state=True,
-    )
-else:
-    st.info("Clique em 'Abrir Câmera' para iniciar o monitoramento.")
+# Inicia o Streamer (CONTROLADO PELO BOTÃO TOGGLE)
+ctx = webrtc_streamer(
+    key="camera_flash",
+    video_processor_factory=MeuProcessadorDeVideo,
+    media_stream_constraints=video_constraints,
+    async_processing=True,
+    desired_playing_state=st.session_state.camera_on,
+)
